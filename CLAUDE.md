@@ -392,6 +392,7 @@ blocked_commands:
 - Maximum 100 commands per project config
 - Blocklisted commands (sudo, dd, shutdown, etc.) can NEVER be allowed
 - Org-level blocked commands cannot be overridden by project configs
+- `rm` targets must resolve inside the project directory (or the system temp dir); `/`, `~`, `.`, `..`, root-level `*`, `$VAR` targets, and removing `.git`/`.autoforge` are blocked
 
 **Files:**
 - `security.py` - Command validation logic and hardcoded blocklist

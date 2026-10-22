@@ -59,7 +59,7 @@ ALLOWED_COMMANDS = {
     "curl",
     # File operations
     "mv",
-    "rm",  # Use with caution
+    "rm",  # Restricted to paths inside the project; validated separately
     "touch",
     # Shell scripts
     "sh",
@@ -71,7 +71,7 @@ ALLOWED_COMMANDS = {
 }
 
 # Commands that need additional validation even when in the allowlist
-COMMANDS_NEEDING_EXTRA_VALIDATION = {"pkill", "chmod", "init.sh", "playwright-cli"}
+COMMANDS_NEEDING_EXTRA_VALIDATION = {"pkill", "chmod", "init.sh", "playwright-cli", "rm"}
 
 # Commands that are NEVER allowed, even with user approval
 # These commands can cause permanent system damage or security breaches
@@ -467,6 +467,189 @@ def validate_playwright_command(command_string: str) -> tuple[bool, str]:
         if token in BLOCKED_SUBCOMMANDS:
             return False, f"playwright-cli '{token}' is not allowed"
         break  # first non-flag token is the subcommand
+
+    return True, ""
+
+
+# Top-level project entries that hold agent/VCS state and must not be removed wholesale.
+# Files *inside* them (e.g. a stale .git/index.lock) can still be removed.
+RM_PROTECTED_PROJECT_ENTRIES = {".git", ".autoforge"}
+
+# Characters that make a path a glob pattern
+_GLOB_CHARS = set("*?[")
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize a path for containment checks (collapses '..', case-folds on Windows)."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _is_strictly_inside(path: str, root: str) -> bool:
+    """Return True if normalized `path` is inside normalized `root` and not `root` itself."""
+    if path == root:
+        return False
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        # Different drives on Windows, or mix of absolute/relative paths
+        return False
+
+
+def _rm_allowed_roots(project_dir: Optional[Path]) -> tuple[str, list[str]]:
+    """
+    Return (project_root, temp_roots) as normalized path strings.
+
+    Temp roots are included in both their literal and symlink-resolved forms
+    (e.g. /tmp and /private/tmp on macOS) so either spelling is accepted.
+    """
+    import tempfile
+
+    project_root = _normalize_path(str((project_dir or Path.cwd()).resolve()))
+
+    temp_candidates = {tempfile.gettempdir()}
+    if os.name != "nt":
+        temp_candidates.add("/tmp")
+    temp_roots: set[str] = set()
+    for candidate in temp_candidates:
+        temp_roots.add(_normalize_path(candidate))
+        temp_roots.add(_normalize_path(str(Path(candidate).resolve())))
+    return project_root, sorted(temp_roots)
+
+
+def _check_rm_target(target: str, project_root: str, temp_roots: list[str]) -> tuple[bool, str]:
+    """Validate a single rm operand. Returns (is_allowed, reason_if_blocked)."""
+    if "$" in target or "`" in target:
+        return False, f"rm target '{target}' uses shell expansion and cannot be validated; use a literal path"
+
+    if target.startswith("~"):
+        return False, f"rm target '{target}' refers to a home directory; rm is restricted to the project directory"
+
+    # Split off any glob component: everything before the first glob component is
+    # the literal base directory that must be validated.
+    parts = re.split(r"[\\/]+", target)
+    glob_index = next((i for i, part in enumerate(parts) if _GLOB_CHARS & set(part)), None)
+
+    if glob_index is not None:
+        glob_part = parts[glob_index]
+        literal = os.sep.join(parts[:glob_index])
+        if target.startswith(("/", "\\")) and not literal:
+            literal = os.sep
+        base = _normalize_path(os.path.join(project_root, literal or "."))
+        error = f"rm pattern '{target}' could match files outside the project directory or the entire project"
+        if ".." in parts[glob_index + 1:]:
+            return False, error
+        # Patterns made only of wildcards and dots ("*", ".*", "**") match everything
+        # in their directory, which is only acceptable below the project root.
+        wildcard_only = set(glob_part) <= {"*", "?", "."}
+        if _is_strictly_inside(base, project_root) or (base == project_root and not wildcard_only):
+            return True, ""
+        if base == project_root or _is_strictly_inside(project_root, base):
+            # A pattern in the project root's parent (or above) could match the project itself
+            return False, error
+        for root in temp_roots:
+            if _is_strictly_inside(base, root) or (base == root and not wildcard_only):
+                return True, ""
+        return False, error
+
+    resolved = _normalize_path(os.path.join(project_root, target))
+
+    if _is_strictly_inside(resolved, project_root):
+        relative_parts = Path(os.path.relpath(resolved, project_root)).parts
+        if len(relative_parts) == 1 and relative_parts[0] in RM_PROTECTED_PROJECT_ENTRIES:
+            return False, f"rm of '{relative_parts[0]}' is not allowed (it holds project/agent state)"
+        return True, ""
+
+    if resolved == project_root or _is_strictly_inside(project_root, resolved):
+        return False, f"rm target '{target}' would remove the project directory"
+
+    if any(_is_strictly_inside(resolved, root) for root in temp_roots):
+        return True, ""
+
+    return False, f"rm target '{target}' is outside the project directory (or is the project directory itself)"
+
+
+def validate_rm_command(command_string: str, project_dir: Optional[Path] = None) -> tuple[bool, str]:
+    """
+    Validate rm commands - only allow removing paths inside the project directory.
+
+    Blocks:
+    - Targets that resolve outside the project directory (e.g. /, ~, ../other)
+    - The project directory itself (".", "./", absolute project path)
+    - Wildcard-only globs at the project root ("*", ".*")
+    - Removing .git or .autoforge wholesale
+    - Targets using shell expansion ($VAR, `cmd`) which cannot be validated statically
+    - --no-preserve-root
+
+    Paths under the system temp directory are also allowed.
+
+    Relative paths are resolved against the project directory (the agent's cwd).
+    A preceding `cd` in the same command line is not tracked, so this is a guard
+    against accidental damage rather than a sandbox; the OS-level sandbox and
+    filesystem restrictions remain the primary boundary.
+
+    Returns:
+        Tuple of (is_allowed, reason_if_blocked)
+    """
+    # Tokenize in non-POSIX mode so quoted operators (e.g. "|") stay quoted and are
+    # not mistaken for real pipes; each word is dequoted individually below.
+    try:
+        lexer = shlex.shlex(command_string, posix=False, punctuation_chars=True)
+        lexer.whitespace_split = True
+        raw_tokens = list(lexer)
+    except ValueError:
+        return False, "Could not parse rm command"
+
+    # Group words into pipeline stages, dropping redirections (and their targets)
+    stages: list[list[str]] = [[]]
+    skip_next = False
+    for raw in raw_tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if raw and all(ch in "|&;()<>" for ch in raw):
+            if "<" in raw or ">" in raw:
+                # Redirection: drop the fd number before it ("2>&1") and its target
+                if stages[-1] and stages[-1][-1].isdigit():
+                    stages[-1].pop()
+                skip_next = True
+            else:
+                stages.append([])
+            continue
+        try:
+            words = shlex.split(raw)
+        except ValueError:
+            return False, "Could not parse rm command"
+        stages[-1].append(" ".join(words))
+
+    rm_stages = []
+    for stage in stages:
+        # Skip leading environment assignments (VAR=value rm ...)
+        while stage and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stage[0]):
+            stage = stage[1:]
+        if stage and os.path.basename(stage[0]) == "rm":
+            rm_stages.append(stage)
+
+    if not rm_stages:
+        return False, "Not an rm command"
+
+    targets = []
+    for stage in rm_stages:
+        end_of_options = False
+        for token in stage[1:]:
+            if not end_of_options and token == "--":
+                end_of_options = True
+                continue
+            if not end_of_options and token.startswith("-") and token != "-":
+                if token == "--no-preserve-root":
+                    return False, "rm --no-preserve-root is not allowed"
+                continue
+            targets.append(token)
+
+    project_root, temp_roots = _rm_allowed_roots(project_dir)
+    for target in targets:
+        allowed, reason = _check_rm_target(target, project_root, temp_roots)
+        if not allowed:
+            return False, reason
 
     return True, ""
 
@@ -964,32 +1147,27 @@ async def bash_security_hook(input_data, tool_use_id=None, context=None):
 
         # Additional validation for sensitive commands
         if cmd in COMMANDS_NEEDING_EXTRA_VALIDATION:
-            # Find the specific segment containing this command by searching
-            # each segment's extracted commands for a match
-            cmd_segment = ""
-            for segment in segments:
-                if cmd in extract_commands(segment):
-                    cmd_segment = segment
-                    break
-            if not cmd_segment:
-                cmd_segment = command  # Fallback to full command
+            # Validate every segment that invokes this command (not just the
+            # first), so e.g. "rm -rf build && rm -rf /" is caught.
+            cmd_segments = [segment for segment in segments if cmd in extract_commands(segment)]
+            if not cmd_segments:
+                cmd_segments = [command]  # Fallback to full command
 
-            if cmd == "pkill":
-                # Pass configured extra processes (beyond defaults)
-                extra_procs = pkill_processes - DEFAULT_PKILL_PROCESSES
-                allowed, reason = validate_pkill_command(cmd_segment, extra_procs if extra_procs else None)
-                if not allowed:
-                    return {"decision": "block", "reason": reason}
-            elif cmd == "chmod":
-                allowed, reason = validate_chmod_command(cmd_segment)
-                if not allowed:
-                    return {"decision": "block", "reason": reason}
-            elif cmd == "init.sh":
-                allowed, reason = validate_init_script(cmd_segment)
-                if not allowed:
-                    return {"decision": "block", "reason": reason}
-            elif cmd == "playwright-cli":
-                allowed, reason = validate_playwright_command(cmd_segment)
+            for cmd_segment in cmd_segments:
+                if cmd == "pkill":
+                    # Pass configured extra processes (beyond defaults)
+                    extra_procs = pkill_processes - DEFAULT_PKILL_PROCESSES
+                    allowed, reason = validate_pkill_command(cmd_segment, extra_procs if extra_procs else None)
+                elif cmd == "chmod":
+                    allowed, reason = validate_chmod_command(cmd_segment)
+                elif cmd == "init.sh":
+                    allowed, reason = validate_init_script(cmd_segment)
+                elif cmd == "playwright-cli":
+                    allowed, reason = validate_playwright_command(cmd_segment)
+                elif cmd == "rm":
+                    allowed, reason = validate_rm_command(cmd_segment, project_dir)
+                else:
+                    allowed, reason = True, ""
                 if not allowed:
                     return {"decision": "block", "reason": reason}
 

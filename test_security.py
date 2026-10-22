@@ -27,6 +27,7 @@ from security import (
     validate_pkill_command,
     validate_playwright_command,
     validate_project_command,
+    validate_rm_command,
 )
 
 
@@ -202,6 +203,92 @@ def test_validate_init_script():
             print(f"         Expected: {expected}, Got: {actual}")
             if reason:
                 print(f"         Reason: {reason}")
+            failed += 1
+
+    return passed, failed
+
+
+def test_validate_rm():
+    """Test rm command validation (restricted to the project directory)."""
+    print("\nTesting rm validation:\n")
+    passed = 0
+    failed = 0
+
+    # A non-existent project path outside the temp directory, so temp-dir
+    # allowances don't mask project-boundary checks.
+    project_dir = Path(os.path.abspath(os.path.join(os.sep, "autoforge-rm-test", "project")))
+    temp_file = os.path.join(tempfile.gettempdir(), "autoforge-rm-test.txt")
+
+    # Test cases: (command, should_be_allowed, description)
+    test_cases = [
+        # Allowed cases
+        ("rm file.txt", True, "single file"),
+        ("rm -rf temp/", True, "relative directory"),
+        ("rm -rf node_modules dist", True, "multiple directories"),
+        ("rm -f src/old.ts", True, "nested file"),
+        ("rm *.log", True, "extension glob at project root"),
+        ("rm -rf src/*", True, "wildcard inside subdirectory"),
+        ("rm -rf ./build", True, "dot-slash relative path"),
+        ("rm -rf " + str(project_dir / "dist"), True, "absolute path inside project"),
+        ("rm -f .git/index.lock", True, "file inside .git"),
+        ("rm -- -weird-name", True, "end of options marker"),
+        ("FOO=1 rm -f a.txt", True, "env assignment prefix"),
+        ("rm x.txt > out.log 2>&1", True, "redirections are not targets"),
+        ("echo y | rm -i a.txt", True, "rm in a pipeline"),
+        ("rm -f " + temp_file, True, "file in system temp dir"),
+        # Blocked cases
+        ("rm -rf /", False, "filesystem root"),
+        ("rm -rf /*", False, "root wildcard"),
+        ("rm --no-preserve-root -rf /", False, "no-preserve-root"),
+        ("rm -rf ~", False, "home directory"),
+        ("rm -rf ~/projects", False, "path under home"),
+        ("rm -rf $HOME", False, "shell variable"),
+        ("rm -rf `pwd`", False, "command substitution"),
+        ("rm -rf $(pwd)", False, "dollar command substitution"),
+        ("rm -rf .", False, "project dir itself"),
+        ("rm -rf ./", False, "project dir with slash"),
+        ("rm -rf " + str(project_dir), False, "absolute project dir"),
+        ("rm -rf ..", False, "parent directory"),
+        ("rm -rf ../other-project", False, "sibling directory"),
+        ("rm -rf src/../../x", False, "traversal out of project"),
+        ("rm -rf *", False, "wildcard at project root"),
+        ("rm -rf ./*", False, "dot-slash wildcard at project root"),
+        ("rm -rf .*", False, "dotfile wildcard at project root"),
+        ("rm -rf ../*", False, "wildcard in parent"),
+        ("rm -rf src/*/../..", False, "traversal after glob"),
+        ("rm -rf /etc/passwd", False, "system file"),
+        ("rm -rf .git", False, "git directory"),
+        ("rm -rf .autoforge", False, "autoforge state directory"),
+        ("rm -rf " + tempfile.gettempdir(), False, "temp dir itself"),
+        ('rm "|" /', False, "quoted pipe does not hide target"),
+        ("ls | rm -rf /", False, "dangerous rm in pipeline"),
+    ]
+
+    for cmd, should_allow, description in test_cases:
+        allowed, reason = validate_rm_command(cmd, project_dir)
+        if allowed == should_allow:
+            print(f"  PASS: {cmd!r} ({description})")
+            passed += 1
+        else:
+            expected = "allowed" if should_allow else "blocked"
+            actual = "allowed" if allowed else "blocked"
+            print(f"  FAIL: {cmd!r} ({description})")
+            print(f"         Expected: {expected}, Got: {actual}")
+            if reason:
+                print(f"         Reason: {reason}")
+            failed += 1
+
+    # Integration: every rm segment in a compound command is validated
+    print("\n  Integration tests (via security hook):\n")
+    hook_cases = [
+        ("rm -rf build && rm -rf dist", False),
+        ("rm -rf build && rm -rf /", True),
+        ("rm -rf build; rm -rf ~", True),
+    ]
+    for cmd, should_block in hook_cases:
+        if check_hook(cmd, should_block=should_block):
+            passed += 1
+        else:
             failed += 1
 
     return passed, failed
@@ -1010,6 +1097,11 @@ def main():
     init_passed, init_failed = test_validate_init_script()
     passed += init_passed
     failed += init_failed
+
+    # Test rm validation
+    rm_passed, rm_failed = test_validate_rm()
+    passed += rm_passed
+    failed += rm_failed
 
     # Test pattern matching (Phase 1)
     pattern_passed, pattern_failed = test_pattern_matching()
