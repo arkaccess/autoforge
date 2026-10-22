@@ -32,6 +32,32 @@ EXTRA_READ_PATHS_VAR = "EXTRA_READ_PATHS"
 EXTRA_READ_PATHS_BLOCKLIST = SENSITIVE_DIRECTORIES
 
 
+# Environment variables for overriding the per-agent-type max_turns limit.
+# AUTOFORGE_MAX_TURNS_<TYPE> (e.g. AUTOFORGE_MAX_TURNS_CODING) takes precedence
+# over AUTOFORGE_MAX_TURNS, which applies to every agent type.
+MAX_TURNS_ENV_VAR = "AUTOFORGE_MAX_TURNS"
+
+
+def get_max_turns(agent_type: str, default: int) -> int:
+    """
+    Resolve the max_turns limit for an agent type, honoring env var overrides.
+
+    Invalid (non-integer or non-positive) values are ignored with a warning.
+    """
+    for var in (f"{MAX_TURNS_ENV_VAR}_{agent_type.upper()}", MAX_TURNS_ENV_VAR):
+        raw = os.getenv(var)
+        if raw is None or not raw.strip():
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        print(f"   - Warning: Ignoring {var}={raw!r} (must be a positive integer)")
+    return default
+
+
 def convert_model_for_vertex(model: str) -> str:
     """
     Convert model name format for Vertex AI compatibility.
@@ -244,12 +270,14 @@ def create_client(
     # Select max_turns based on agent type:
     #   - coding/initializer: 300 turns (complex multi-step implementation)
     #   - testing: 100 turns (focused verification of a single feature)
+    # Override via AUTOFORGE_MAX_TURNS_<TYPE> (e.g. AUTOFORGE_MAX_TURNS_TESTING=150)
+    # or AUTOFORGE_MAX_TURNS for all agent types.
     max_turns_map = {
         "coding": 300,
         "testing": 100,
         "initializer": 300,
     }
-    max_turns = max_turns_map.get(agent_type, 300)
+    max_turns = get_max_turns(agent_type, max_turns_map.get(agent_type, 300))
 
     # Build allowed tools list based on agent type.
     allowed_tools = [*BUILTIN_TOOLS, *feature_tools]
@@ -328,6 +356,7 @@ def create_client(
     # Build MCP servers config - features is always included, playwright only in standard mode
     mcp_servers = {
         "features": {
+            "type": "stdio",
             "command": sys.executable,  # Use the same Python that's running this script
             "args": ["-m", "mcp_server.feature_mcp"],
             "env": {
@@ -492,7 +521,8 @@ def create_client(
             # parameters. Instead, context is managed via:
             # 1. betas=["context-1m-2025-08-07"] - Extended context window
             # 2. PreCompact hook - Intercept and customize compaction behavior
-            # 3. max_turns - Limit conversation turns (per agent type: coding=300, testing=100)
+            # 3. max_turns - Limit conversation turns (per agent type: coding=300, testing=100;
+            #    override with AUTOFORGE_MAX_TURNS / AUTOFORGE_MAX_TURNS_<TYPE>)
             #
             # Future SDK versions may add explicit compaction controls. When available,
             # consider adding:

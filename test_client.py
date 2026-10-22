@@ -16,8 +16,10 @@ from pathlib import Path
 from client import (
     EXTRA_READ_PATHS_BLOCKLIST,
     EXTRA_READ_PATHS_VAR,
+    MAX_TURNS_ENV_VAR,
     convert_model_for_vertex,
     get_extra_read_paths,
+    get_max_turns,
 )
 
 
@@ -114,6 +116,48 @@ class TestConvertModelForVertex(unittest.TestCase):
     def test_empty_string_unchanged(self):
         os.environ["CLAUDE_CODE_USE_VERTEX"] = "1"
         self.assertEqual(convert_model_for_vertex(""), "")
+
+
+class TestGetMaxTurns(unittest.TestCase):
+    """Tests for get_max_turns env var overrides."""
+
+    VARS = [MAX_TURNS_ENV_VAR, f"{MAX_TURNS_ENV_VAR}_CODING", f"{MAX_TURNS_ENV_VAR}_TESTING"]
+
+    def setUp(self):
+        self._orig = {var: os.environ.get(var) for var in self.VARS}
+        for var in self.VARS:
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        for var, value in self._orig.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+
+    def test_default_when_unset(self):
+        self.assertEqual(get_max_turns("coding", 300), 300)
+
+    def test_global_override(self):
+        os.environ[MAX_TURNS_ENV_VAR] = "50"
+        self.assertEqual(get_max_turns("coding", 300), 50)
+        self.assertEqual(get_max_turns("testing", 100), 50)
+
+    def test_per_type_override_takes_precedence(self):
+        os.environ[MAX_TURNS_ENV_VAR] = "50"
+        os.environ[f"{MAX_TURNS_ENV_VAR}_TESTING"] = "150"
+        self.assertEqual(get_max_turns("testing", 100), 150)
+        self.assertEqual(get_max_turns("coding", 300), 50)
+
+    def test_invalid_values_ignored(self):
+        for bad in ["abc", "0", "-5", "  "]:
+            os.environ[f"{MAX_TURNS_ENV_VAR}_CODING"] = bad
+            self.assertEqual(get_max_turns("coding", 300), 300, bad)
+
+    def test_invalid_per_type_falls_back_to_global(self):
+        os.environ[MAX_TURNS_ENV_VAR] = "75"
+        os.environ[f"{MAX_TURNS_ENV_VAR}_CODING"] = "nope"
+        self.assertEqual(get_max_turns("coding", 300), 75)
 
 
 class TestExtraReadPathsBlocklist(unittest.TestCase):
