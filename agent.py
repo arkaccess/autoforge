@@ -124,6 +124,32 @@ async def run_agent_session(
                                     # Tool succeeded - just show brief confirmation
                                     print("   [Done]", flush=True)
 
+                    # Handle SystemMessage (CLI notifications). "init" and hook
+                    # chatter are skipped; context compaction is worth surfacing.
+                    elif msg_type == "SystemMessage":
+                        if getattr(msg, "subtype", "") == "compact_boundary":
+                            print("\n[System] Context compacted", flush=True)
+
+                    # Handle ResultMessage (final message of the turn). Surface
+                    # error results (e.g. max turns reached, API errors) which
+                    # would otherwise end the session silently.
+                    elif msg_type == "ResultMessage":
+                        subtype = getattr(msg, "subtype", "") or ""
+                        is_error = bool(getattr(msg, "is_error", False))
+                        if is_error or subtype.startswith("error"):
+                            result_text = str(getattr(msg, "result", "") or "")
+                            num_turns = getattr(msg, "num_turns", "?")
+                            print(
+                                f"\n[Session ended with error: {subtype or 'unknown'} after {num_turns} turns]",
+                                flush=True,
+                            )
+                            if result_text:
+                                print(f"   {result_text[:500]}", flush=True)
+                                # Make the error text visible to the caller's
+                                # rate-limit detection, which inspects response_text.
+                                if result_text not in response_text:
+                                    response_text += f"\n{result_text}"
+
                 break  # Normal completion
             except Exception as inner_exc:
                 if type(inner_exc).__name__ == "MessageParseError":
